@@ -105,6 +105,7 @@ def lambda_handler(event, context):
 
     # Create the public and private hosted zone collections.  These are collections of zones in Route 53.
     hosted_zones = route53.list_hosted_zones()
+    hosted_zones_collection = map(lambda x: x['Name'], hosted_zones['HostedZones'])
     private_hosted_zones = filter(lambda x: x['Config']['PrivateZone'] is True, hosted_zones['HostedZones'])
     private_hosted_zone_collection = map(lambda x: x['Name'], private_hosted_zones)
     public_hosted_zones = filter(lambda x: x['Config']['PrivateZone'] is False, hosted_zones['HostedZones'])
@@ -133,138 +134,94 @@ def lambda_handler(event, context):
     # Wait a random amount of time.  This is a poor-mans back-off if a lot of instances are launched all at once.
     time.sleep(random.random())
 
-    # Loop through the instance's tags, looking for the zone and cname tags.  If either of these tags exist, check
-    # to make sure that the name is valid.  If it is and if there's a matching zone in DNS, create A and PTR records.
-    for tag in tags:
-        if 'ZONE' in tag.get('Key',{}).lstrip().upper():
-            if is_valid_hostname(tag.get('Value')):
-                if tag.get('Value').lstrip().lower() in private_hosted_zone_collection:
-                    print 'Private zone found:', tag.get('Value')
-                    private_hosted_zone_name = tag.get('Value').lstrip().lower()
-                    private_hosted_zone_id = get_zone_id(private_hosted_zone_name)
-                    private_hosted_zone_properties = get_hosted_zone_properties(private_hosted_zone_id)
-                    if state == 'running':
-                        if vpc_id in map(lambda x: x['VPCId'], private_hosted_zone_properties['VPCs']):
-                            print 'Private hosted zone %s is associated with VPC %s' % (private_hosted_zone_id, vpc_id)
-                        else:
-                            print 'Associating zone %s with VPC %s' % (private_hosted_zone_id, vpc_id)
-                            try:
-                                associate_zone(private_hosted_zone_id, region, vpc_id)
-                            except BaseException as e:
-                                print 'You cannot create an association with a VPC with an overlapping subdomain.\n', e
-                                exit()
-                        try:
-                            create_resource_record(private_hosted_zone_id, private_host_name, private_hosted_zone_name, 'A', private_ip)
-                            create_resource_record(reverse_lookup_zone_id, reversed_ip_address, 'in-addr.arpa', 'PTR', private_dns_name)
-                        except BaseException as e:
-                            print e
-                    else:
-                        try:
-                            delete_resource_record(private_hosted_zone_id, private_host_name, private_hosted_zone_name, 'A', private_ip)
-                            delete_resource_record(reverse_lookup_zone_id, reversed_ip_address, 'in-addr.arpa', 'PTR', private_dns_name)
-                        except BaseException as e:
-                            print e
-                    # create PTR record
-                elif tag.get('Value').lstrip().lower() in public_hosted_zones_collection:
-                    print 'Public zone found', tag.get('Value')
-                    public_hosted_zone_name = tag.get('Value').lstrip().lower()
-                    public_hosted_zone_id = get_zone_id(public_hosted_zone_name)
-                    # create A record in public zone
-                    if state =='running':
-                        try:
-                            create_resource_record(public_hosted_zone_id, public_host_name, public_hosted_zone_name, 'A', public_ip)
-                        except BaseException as e:
-                            print e
-                    else:
-                        try:
-                            delete_resource_record(public_hosted_zone_id, public_host_name, public_hosted_zone_name, 'A', public_ip)
-                        except BaseException as e:
-                            print e
-                else:
-                    print 'No matching zone found for %s' % tag.get('Value')
-            else:
-                print '%s is not a valid host name' % tag.get('Value')
-        # Consider making this an elif CNAME
+    private_hosted_zone_name = 'awsi.drafthouse.com.'
+    public_hosted_zone_name = 'aws.drafthouse.com.'
+    
+    requested_internal_host_name = first_tag_value(tags, ['InternalHostName', 'HostName', 'Name'])
+    requested_external_host_name = first_tag_value(tags, ['ExternalHostName', 'HostName', 'Name'])
+
+#    internal_host_name = (requested_internal_host_name or private_host_name) + "i"
+    internal_host_name = (requested_internal_host_name or private_host_name)
+    raw_internal_cname = first_tag_value(tags, ['InternalCName', 'CName'])
+#    internal_cname = raw_internal_cname + "i" if raw_internal_cname else None
+    internal_cname = raw_internal_cname
+    external_host_name = requested_external_host_name or public_host_name
+    external_cname = first_tag_value(tags, ['ExternalCName', 'CName'])
+    
+    print "Internal host name: " + internal_host_name
+
+    if private_hosted_zone_name in private_hosted_zone_collection:
+        print 'Private zone found:', private_hosted_zone_name
+        private_hosted_zone_id = get_zone_id(private_hosted_zone_name)
+        private_hosted_zone_properties = get_hosted_zone_properties(private_hosted_zone_id)
+        if state == 'running':
+#            if vpc_id in map(lambda x: x['VPCId'], private_hosted_zone_properties['VPCs']):
+#                print 'Private hosted zone %s is associated with VPC %s' % (private_hosted_zone_id, vpc_id)
+#            else:
+#                print 'Associating zone %s with VPC %s' % (private_hosted_zone_id, vpc_id)
+#                try:
+#                    associate_zone(private_hosted_zone_id, region, vpc_id)
+#                except BaseException as e:
+#                    print 'You cannot create an association with a VPC with an overlapping subdomain.\n', e
+#                    exit()
+            try:
+#                create_resource_record(private_hosted_zone_id, private_host_name, private_hosted_zone_name, 'A', private_ip)
+                create_resource_record(private_hosted_zone_id, internal_host_name, private_hosted_zone_name, 'A', private_ip)
+#                create_resource_record(private_hosted_zone_id, internal_host_name, private_hosted_zone_name, 'CNAME', private_dns_name)
+#                create_resource_record(reverse_lookup_zone_id, reversed_ip_address, 'in-addr.arpa', 'PTR', private_dns_name)
+                create_resource_record(reverse_lookup_zone_id, reversed_ip_address, 'in-addr.arpa', 'PTR', internal_host_name + "." + private_hosted_zone_name)
+                if internal_cname:
+#                    create_resource_record(private_hosted_zone_id, internal_cname, private_hosted_zone_name, 'CNAME', private_dns_name)
+                    create_resource_record(private_hosted_zone_id, internal_cname, private_hosted_zone_name, 'CNAME', internal_host_name + "." + private_hosted_zone_name)
+            except BaseException as e:
+                print e
         else:
-            print 'The tag \'%s\' is not a zone tag' % tag.get('Key')
-        if 'CNAME' in tag.get('Key',{}).lstrip().upper():
-            if is_valid_hostname(tag.get('Value')):
-                cname = tag.get('Value').lstrip().lower()
-                cname_host_name = cname.split('.')[0]
-                cname_domain_suffix = cname[cname.find('.')+1:]
-                cname_domain_suffix_id = get_zone_id(cname_domain_suffix)
-                for cname_private_hosted_zone in private_hosted_zone_collection:
-                    cname_private_hosted_zone_id = get_zone_id(cname_private_hosted_zone)
-                    if cname_domain_suffix_id == cname_private_hosted_zone_id:
-                        if cname.endswith(cname_private_hosted_zone):
-                            #create CNAME record in private zone
-                            if state == 'running':
-                                try:
-                                    create_resource_record(cname_private_hosted_zone_id, cname_host_name, cname_private_hosted_zone, 'CNAME', private_dns_name)
-                                except BaseException as e:
-                                    print e
-                            else:
-                                try:
-                                    delete_resource_record(cname_private_hosted_zone_id, cname_host_name, cname_private_hosted_zone, 'CNAME', private_dns_name)
-                                except BaseException as e:
-                                    print e
-                for cname_public_hosted_zone in public_hosted_zones_collection:
-                    if cname.endswith(cname_public_hosted_zone):
-                        cname_public_hosted_zone_id = get_zone_id(cname_public_hosted_zone)
-                        #create CNAME record in public zone
-                        if state == 'running':
-                            try:
-                                create_resource_record(cname_public_hosted_zone_id, cname_host_name, cname_public_hosted_zone, 'CNAME', public_dns_name)
-                            except BaseException as e:
-                                print e
-                        else:
-                            try:
-                                delete_resource_record(cname_public_hosted_zone_id, cname_host_name, cname_public_hosted_zone, 'CNAME', public_dns_name)
-                            except BaseException as e:
-                                print e
-    # Is there a DHCP option set?
-    # Get DHCP option set configuration
-    try:
-        dhcp_options_id = vpc.dhcp_options_id
-        dhcp_configurations = get_dhcp_configurations(dhcp_options_id)
-    except BaseException as e:
-        print 'No DHCP option set assigned to this VPC\n', e
-        exit()
-    # Look to see whether there's a DHCP option set assigned to the VPC.  If there is, use the value of the domain name
-    # to create resource records in the appropriate Route 53 private hosted zone. This will also check to see whether
-    # there's an association between the instance's VPC and the private hosted zone.  If there isn't, it will create it.
-    for configuration in dhcp_configurations:
-        if configuration[0] in private_hosted_zone_collection:
-            private_hosted_zone_name = configuration[0]
-            print 'Private zone found %s' % private_hosted_zone_name
-            # TODO need a way to prevent overlapping subdomains
-            private_hosted_zone_id = get_zone_id(private_hosted_zone_name)
-            private_hosted_zone_properties = get_hosted_zone_properties(private_hosted_zone_id)
-            # create A records and PTR records
-            if state == 'running':
-                if vpc_id in map(lambda x: x['VPCId'], private_hosted_zone_properties['VPCs']):
-                    print 'Private hosted zone %s is associated with VPC %s' % (private_hosted_zone_id, vpc_id)
-                else:
-                    print 'Associating zone %s with VPC %s' % (private_hosted_zone_id, vpc_id)
-                    try:
-                        associate_zone(private_hosted_zone_id, region,vpc_id)
-                    except BaseException as e:
-                        print 'You cannot create an association with a VPC with an overlapping subdomain.\n', e
-                        exit()
-                try:
-                    create_resource_record(private_hosted_zone_id, private_host_name, private_hosted_zone_name, 'A', private_ip)
-                    create_resource_record(reverse_lookup_zone_id, reversed_ip_address, 'in-addr.arpa', 'PTR', private_dns_name)
-                except BaseException as e:
-                    print e
-            else:
-                try:
-                    delete_resource_record(private_hosted_zone_id, private_host_name, private_hosted_zone_name, 'A', private_ip)
-                    delete_resource_record(reverse_lookup_zone_id, reversed_ip_address, 'in-addr.arpa', 'PTR', private_dns_name)
-                except BaseException as e:
-                    print e
+            try:
+                delete_resource_record(private_hosted_zone_id, private_host_name, private_hosted_zone_name, 'A', private_ip)
+                delete_resource_record(private_hosted_zone_id, internal_host_name, private_hosted_zone_name, 'A', private_ip)
+                delete_resource_record(private_hosted_zone_id, internal_host_name, private_hosted_zone_name, 'CNAME', private_dns_name)
+#                delete_resource_record(reverse_lookup_zone_id, reversed_ip_address, 'in-addr.arpa', 'PTR', private_dns_name)
+                delete_resource_record(reverse_lookup_zone_id, reversed_ip_address, 'in-addr.arpa', 'PTR', internal_host_name + "." + private_hosted_zone_name)
+                if internal_cname:
+#                    delete_resource_record(private_hosted_zone_id, internal_cname, private_hosted_zone_name, 'CNAME', private_dns_name)
+                    delete_resource_record(private_hosted_zone_id, internal_cname, private_hosted_zone_name, 'CNAME', internal_host_name + "." + private_hosted_zone_name)
+            except BaseException as e:
+                print e
+        # create PTR record
+    else:
+        print 'No private zone found for %s' % private_hosted_zone_name
+
+
+    if public_hosted_zone_name in public_hosted_zones_collection:
+        print 'Public zone found', public_hosted_zone_name
+        public_hosted_zone_id = get_zone_id(public_hosted_zone_name)
+        # create A record in public zone
+        if state =='running':
+            try:
+#                if public_host_name:
+#                    create_resource_record(public_hosted_zone_id, public_host_name, public_hosted_zone_name, 'A', public_ip)
+                if external_host_name:
+                    create_resource_record(public_hosted_zone_id, external_host_name, public_hosted_zone_name, 'CNAME', public_dns_name)
+                if external_cname:
+#                    create_resource_record(public_hosted_zone_id, external_cname, public_hosted_zone_name, 'CNAME', public_dns_name)
+                    create_resource_record(public_hosted_zone_id, external_cname, public_hosted_zone_name, 'CNAME', external_host_name + "." + public_hosted_zone_name)
+            except BaseException as e:
+                print e
         else:
-            print 'No matching zone for %s' % configuration[0]
-            
+            try:
+                if public_host_name:
+                    delete_resource_record(public_hosted_zone_id, public_host_name, public_hosted_zone_name, 'A', public_ip)
+                if external_host_name:
+                    delete_resource_record(public_hosted_zone_id, external_host_name, public_hosted_zone_name, 'A', public_ip)
+                    delete_resource_record(public_hosted_zone_id, external_host_name, public_hosted_zone_name, 'CNAME', public_dns_name)
+                if external_cname:
+#                    delete_resource_record(public_hosted_zone_id, external_cname, public_hosted_zone_name, 'CNAME', public_dns_name)
+                    delete_resource_record(public_hosted_zone_id, external_cname, public_hosted_zone_name, 'CNAME', external_host_name + "." + public_hosted_zone_name)
+            except BaseException as e:
+                print e
+    else:
+        print 'No public zone found for %s' % public_hosted_zone_name
+
     # Clean up DynamoDB after deleting records
     if state != 'running':
         table.delete_item(
@@ -273,6 +230,22 @@ def lambda_handler(event, context):
             }
         )
         
+def tag_value(tags, tag_name):
+    for tag in tags:
+        if tag_name.lstrip().upper() == tag.get('Key',{}).lstrip().upper():
+            return tag.get('Value')
+    # No matching tag, return None
+    return None
+    
+def first_tag_value(tags, tag_names):
+    for tag in tags:
+        entry_name = tag.get('Key', {}).lstrip().upper()
+        for tag_name in tag_names:
+            if tag_name.lstrip().upper() == entry_name:
+                return tag.get('Value')
+    # No matching tags, return None
+    return None
+    
 def create_table(table_name):
     dynamodb_client.create_table(
             TableName=table_name,
@@ -324,31 +297,35 @@ def create_resource_record(zone_id, host_name, hosted_zone_name, type, value):
             )
 
 def delete_resource_record(zone_id, host_name, hosted_zone_name, type, value):
-    """This function deletes resource records from the hosted zone passed by the calling function."""
-    print 'Deleting %s record %s in zone %s' % (type, host_name, hosted_zone_name)
-    if host_name[-1] != '.':
-        host_name = host_name + '.'
-    route53.change_resource_record_sets(
-                HostedZoneId=zone_id,
-                ChangeBatch={
-                    "Comment": "Updated by Lambda DDNS",
-                    "Changes": [
-                        {
-                            "Action": "DELETE",
-                            "ResourceRecordSet": {
-                                "Name": host_name + hosted_zone_name,
-                                "Type": type,
-                                "TTL": 60,
-                                "ResourceRecords": [
-                                    {
-                                        "Value": value
-                                    },
-                                ]
-                            }
-                        },
-                    ]
-                }
-            )
+    try:
+        """This function deletes resource records from the hosted zone passed by the calling function."""
+        print 'Deleting %s record %s in zone %s' % (type, host_name, hosted_zone_name)
+        if host_name[-1] != '.':
+            host_name = host_name + '.'
+        route53.change_resource_record_sets(
+                    HostedZoneId=zone_id,
+                    ChangeBatch={
+                        "Comment": "Updated by Lambda DDNS",
+                        "Changes": [
+                            {
+                                "Action": "DELETE",
+                                "ResourceRecordSet": {
+                                    "Name": host_name + hosted_zone_name,
+                                    "Type": type,
+                                    "TTL": 60,
+                                    "ResourceRecords": [
+                                        {
+                                            "Value": value
+                                        },
+                                    ]
+                                }
+                            },
+                        ]
+                    }
+                )
+    except BaseException as e:
+        print e
+        
 def get_zone_id(zone_name):
     """This function returns the zone id for the zone name that's passed into the function."""
     if zone_name[-1] != '.':
@@ -375,6 +352,7 @@ def get_dhcp_configurations(dhcp_options_id):
     """This function returns the names of the zones/domains that are in the option set."""
     zone_names = []
     dhcp_options = ec2.DhcpOptions(dhcp_options_id)
+    print("DHCP Options ID: " + dhcp_options_id)
     dhcp_configurations = dhcp_options.dhcp_configurations
     for configuration in dhcp_configurations:
         zone_names.append(map(lambda x: x['Value'] + '.', configuration['Values']))
