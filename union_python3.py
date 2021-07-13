@@ -37,8 +37,10 @@ LOGGER.setLevel(logging.INFO)
 ACCOUNT = None
 REGION = None
 SNS_CLIENT = None
+VERSION = "1P"
 
 print('Loading function ' + datetime.datetime.now().time().isoformat())
+LOGGER.info("Version %s", VERSION)
 
 def lineno():  # pragma: no cover
     """
@@ -108,6 +110,7 @@ def lambda_handler(
     :param sns_client:
     :return:
     """
+    LOGGER.info("Handling event with version %s", VERSION)
     LOGGER.info("event: %s", str(event) + lineno())
     LOGGER.info("context: %s", str(context) + lineno())
     SNS_CLIENT = sns_client
@@ -136,7 +139,7 @@ def lambda_handler(
 
     # Only doing something if the state is running
     if state == 'running':
-        LOGGER.debug("sleeping for 60 seconds %s", lineno())
+        LOGGER.info("sleeping for 60 seconds to let instances settle %s", lineno())
 
         if "pytest" in sys.modules:
             # called from within a test run
@@ -269,6 +272,7 @@ to use Route 53 private hosted zones. ' + lineno())
     # Create the public and private hosted zone collections.
     # These are collections of zones in Route 53.
     hosted_zones = list_hosted_zones(route53)
+    hosted_zones_collection = map(lambda x: x['Name'], hosted_zones['HostedZones'])
     LOGGER.debug("hosted_zones: %s", str(hosted_zones) + lineno())
     private_hosted_zones = get_private_hosted_zones(hosted_zones)
     LOGGER.debug("private_hosted_zones: %s", str(list(private_hosted_zones)) + lineno())
@@ -327,583 +331,78 @@ with VPC %s %s", reverse_lookup_zone_id, vpc_id, lineno())
     # if a lot of instances are launched all at once.
     time.sleep(random.random())
 
-    if tag_type == 'cname':
-        # We must have a cname because we want reverse dns to point to the A record
-        cname = get_cname_from_tags(tags)
-        cname_prefix = cname.split('.')[0]
-        if not cname:
-            publish_to_sns(
-                SNS_CLIENT,
-                ACCOUNT, REGION,
-                "Must have a CNAME tag for lambda to work. "
-                "Please add CNAME to instance tags" + lineno()
-            )
+    private_hosted_zone_name = 'awsi.drafthouse.com.'
+    public_hosted_zone_name = 'aws.drafthouse.com.'
+    
+    requested_internal_host_name = first_tag_value(tags, ['InternalHostName', 'HostName', 'Name'])
+    requested_external_host_name = first_tag_value(tags, ['ExternalHostName', 'HostName', 'Name'])
 
-    LOGGER.debug("iterating through tags %s", lineno())
-    # Loop through the instance's tags, looking for the zone and
-    # cname tags.  If either of these tags exist, check
-    # to make sure that the name is valid.  If it is and
-    # if there's a matching zone in DNS, create A and PTR records.
-    for tag in tags:
-        LOGGER.debug("#### tag: %s", str(tag) + lineno())
-        if 'ZONE' in tag.get('Key', {}).lstrip().upper():
+#    internal_host_name = (requested_internal_host_name or private_host_name) + "i"
+    internal_host_name = (requested_internal_host_name or private_host_name)
+    raw_internal_cname = first_tag_value(tags, ['InternalCName', 'CName'])
+#    internal_cname = raw_internal_cname + "i" if raw_internal_cname else None
+    internal_cname = raw_internal_cname
+    external_host_name = requested_external_host_name or public_host_name
+    external_cname = first_tag_value(tags, ['ExternalCName', 'CName'])
+    
+    LOGGER.info("Internal host name: %s", internal_host_name)
 
-            # Simple check to make sure the hostname is valid
-            if is_valid_hostname(tag.get('Value')):
-                LOGGER.debug("hostname is valid %s", lineno())
-                LOGGER.debug("checking if value in private:"
-                             " %s", str(list(private_hosted_zone_collection)) + lineno())
-                LOGGER.debug("checking if value in public:"
-                             " %s", str(list(public_hosted_zones_collection)) + lineno())
-
-                if tag.get('Value').lstrip().lower() in private_hosted_zone_collection:
-                    LOGGER.debug("Private zone found: %s", str(tag.get('Value')) + lineno())
-                    private_hosted_zone_name = tag.get('Value').lstrip().lower()
-                    LOGGER.debug("private_zone_name: %s", str(private_hosted_zone_name) + lineno())
-                    private_hosted_zone_id = get_zone_id(route53, private_hosted_zone_name)
-                    LOGGER.debug("private_hosted_zone_id:"
-                                 " %s", str(private_hosted_zone_id) + lineno())
-                    private_hosted_zone_properties = \
-                        get_hosted_zone_properties(route53, private_hosted_zone_id)
-                    LOGGER.debug("private_hosted_zone_properties:"
-                                 " %s", str(private_hosted_zone_properties) + lineno())
-                    if state == 'running':
-                        found_vpc_id = False
-                        if 'VPCs' in private_hosted_zone_properties:
-                            for vpc in private_hosted_zone_properties['VPCs']:
-                                if vpc['VPCId'] == vpc_id:
-                                    found_vpc_id = True
-                        if found_vpc_id:
-                            LOGGER.info("Private hosted zone %s is associated with \
-VPC %s %s", private_hosted_zone_id, vpc_id, lineno())
-                        else:
-                            LOGGER.info("Associating zone %s with \
-VPC %s %s", private_hosted_zone_id, vpc_id, lineno())
-                            try:
-                                associate_zone(route53, private_hosted_zone_id, region, vpc_id)
-                            except BaseException as err:
-                                LOGGER.info('You cannot create an association with a VPC \
-with an overlapping subdomain.\n', err)
-                                publish_to_sns(SNS_CLIENT, ACCOUNT, REGION, "Unexpected error:" +
-                                               str(err) + lineno())
-                                exit()
-                        try:
-
-                            create_resource_record(
-                                route53,
-                                private_hosted_zone_id,
-                                private_host_name,
-                                private_hosted_zone_name,
-                                'A',
-                                private_ip
-                            )
-
-                            LOGGER.debug("appending to caller response %s", lineno())
-
-                            caller_response.append('Created A record in zone id: ' +
-                                                   str(private_hosted_zone_id) +
-                                                   ' for hosted zone ' +
-                                                   str(private_host_name) + '.' +
-                                                   str(private_hosted_zone_name) +
-                                                   ' with value: ' +
-                                                   str(private_ip))
-
-                            create_resource_record(
-                                route53,
-                                reverse_lookup_zone_id,
-                                reversed_ip_address,
-                                'in-addr.arpa',
-                                'PTR',
-                                private_dns_name
-                            )
-
-                            caller_response.append('Created PTR record in zone id: ' +
-                                                   str(reverse_lookup_zone_id) +
-                                                   ' for hosted zone ' +
-                                                   str(reversed_ip_address) +
-                                                   'in-addr.arpa with value: ' +
-                                                   str(private_dns_name))
-
-
-                        except BaseException as err:
-                            publish_to_sns(SNS_CLIENT, ACCOUNT, REGION, "Unexpected error:" +
-                                           str(err) + lineno())
-                            LOGGER.debug("%s", str(err)+lineno())
-                    else:
-                        try:
-                            delete_resource_record(
-                                route53,
-                                private_hosted_zone_id,
-                                private_host_name,
-                                private_hosted_zone_name,
-                                'A',
-                                private_ip
-                            )
-
-                            caller_response.append('Deleted A record in zone id: ' +
-                                                   str(private_hosted_zone_id) +
-                                                   ' for hosted zone ' +
-                                                   str(private_host_name) + '.' +
-                                                   str(private_hosted_zone_name) +
-                                                   ' with value: ' +
-                                                   str(private_ip))
-
-                            delete_resource_record(
-                                route53,
-                                reverse_lookup_zone_id,
-                                reversed_ip_address,
-                                'in-addr.arpa',
-                                'PTR',
-                                private_dns_name
-                            )
-
-                            caller_response.append('Deleted PTR record in zone id: ' +
-                                                   str(reverse_lookup_zone_id) +
-                                                   ' for hosted zone ' +
-                                                   str(reversed_ip_address) + '.' +
-                                                   str(private_dns_name) +
-                                                   ' with value: ' +
-                                                   str(private_dns_name))
-
-                        except BaseException as err:
-                            publish_to_sns(SNS_CLIENT, ACCOUNT, REGION, "Unexpected error:" +
-                                           str(err) + lineno())
-                            LOGGER.debug("%s", str(err)+lineno())
-                    # create PTR record
-                elif tag.get('Value').lstrip().lower() in public_hosted_zones_collection:
-                    LOGGER.debug("Public zone found %s", tag.get('Value') + lineno())
-                    public_hosted_zone_name = tag.get('Value').lstrip().lower()
-
-                    public_hosted_zone_id = get_zone_id(
-                        route53,
-                        public_hosted_zone_name,
-                        private_zone=False
-                    )
-
-                    # create A record in public zone
-                    if state == 'running':
-                        try:
-
-                            create_resource_record(
-                                route53,
-                                public_hosted_zone_id,
-                                cname_prefix,
-                                public_hosted_zone_name,
-                                'A',
-                                public_ip
-                            )
-
-                            caller_response.append('Created A record in zone id: ' +
-                                                   str(public_hosted_zone_id) +
-                                                   ' for hosted zone ' +
-                                                   str(cname_prefix) + '.' +
-                                                   str(public_hosted_zone_name) +
-                                                   ' with value: ' +
-                                                   str(public_ip))
-
-                        except BaseException as err:
-                            publish_to_sns(SNS_CLIENT, ACCOUNT, REGION, "Unexpected error:" +
-                                           str(err) + lineno())
-                            LOGGER.debug("%s", str(err) + lineno())
-                    else:
-                        try:
-
-                            delete_resource_record(
-                                route53,
-                                public_hosted_zone_id,
-                                cname_prefix,
-                                public_hosted_zone_name,
-                                'A',
-                                public_ip
-                            )
-
-                            caller_response.append('Deleted A record in zone id: ' +
-                                                   str(public_hosted_zone_id) +
-                                                   ' for hosted zone ' +
-                                                   str(cname_prefix) + '.' +
-                                                   str(public_hosted_zone_name) +
-                                                   ' with value: ' +
-                                                   str(public_ip))
-
-                        except BaseException as err:
-                            publish_to_sns(SNS_CLIENT, ACCOUNT, REGION, "Unexpected error:" +
-                                           str(err) + lineno())
-                            LOGGER.debug("%s", str(err) + lineno())
-                else:
-                    LOGGER.info("No matching zone found for %s", tag.get('Value'))
-            else:
-                LOGGER.info("%s is not a valid host name %s", tag.get('Value'), lineno())
-        # Consider making this an elif CNAME
-        else:
-            LOGGER.debug("The tag \'%s\' is not a zone tag %s", str(tag.get('Key')), lineno())
-
-        if 'CNAME' in tag.get('Key', {}).lstrip().upper():
-
-            # Simple hostname check
-            if is_valid_hostname(tag.get('Value')):
-
-                LOGGER.debug("CNAME hostname of %s is valid %s", str(tag.get('Value')), lineno())
-                # convert the cname value to lower case and strip whitespace and newline characters
-                icname = tag.get('Value').lstrip().lower()
-
-                LOGGER.debug("icname: %s", str(icname) + lineno())
-                # Gets the prefix for the cname
-                cname_host_name = icname.split('.')[0]
-                LOGGER.debug("cname_host_name: %s", str(cname_host_name) + lineno())
-
-                # Gets suffix
-                cname_domain_suffix = icname[icname.find('.') + 1:]
-                LOGGER.debug("cname_domain_suffix: %s", str(cname_domain_suffix) + lineno())
-
-                # Try and find the hosted zone with the cname suffix
-                cname_domain_suffix_id = get_zone_id(route53, cname_domain_suffix)
-
-                LOGGER.debug("cname_domain_suffix_id: %s", str(cname_domain_suffix_id))
-                # Iterate of the private hosted zones
-                LOGGER.debug("Iterating over private hosted zones %s", lineno())
-                for cname_private_hosted_zone in private_hosted_zone_collection:
-
-                    LOGGER.debug("cname for private hosted zone in private hosted \
-zone collection: %s", str(cname_private_hosted_zone) + lineno())
-
-                    cname_private_hosted_zone_id = get_zone_id(route53, cname_private_hosted_zone)
-                    LOGGER.debug("cname_private_hosted_zone_id:"
-                                 " %s", str(cname_private_hosted_zone_id) + lineno())
-                    LOGGER.debug("cname_domain_suffix_id:"
-                                 " %s", str(cname_domain_suffix_id) + lineno())
-
-                    if cname_domain_suffix_id == cname_private_hosted_zone_id:
-                        LOGGER.debug("cname_domain_suffix_id:"
-                                     " %s", str(cname_domain_suffix_id) + lineno())
-
-                        if cname.endswith(cname_private_hosted_zone):
-                            LOGGER.debug("cname ends with"
-                                         " %s", str(cname_private_hosted_zone) + lineno())
-
-                            # create CNAME record in private zone
-                            if state == 'running':
-                                try:
-                                    LOGGER.debug("creating resource record %s", lineno())
-                                    LOGGER.debug("private_dns_name:"
-                                                 " %s", str(private_dns_name) + lineno())
-                                    create_resource_record(
-                                        route53,
-                                        cname_private_hosted_zone_id,
-                                        cname_host_name,
-                                        cname_private_hosted_zone,
-                                        'CNAME',
-                                        private_dns_name
-                                    )
-
-                                    caller_response.append('Created CNAME record in zone id: ' +
-                                                           str(cname_private_hosted_zone_id) +
-                                                           ' for hosted zone ' +
-                                                           str(cname_host_name) + '.' +
-                                                           str(cname_private_hosted_zone) +
-                                                           ' with value: ' +
-                                                           str(private_dns_name))
-
-                                except BaseException as err:
-                                    publish_to_sns(SNS_CLIENT, ACCOUNT, REGION,
-                                                   "Unexpected error:" + str(err) + lineno())
-                                    LOGGER.debug("%s", str(err) + lineno())
-                            else:
-                                try:
-                                    LOGGER.debug("deleting resource record %s", lineno())
-                                    delete_resource_record(
-                                        route53,
-                                        cname_private_hosted_zone_id,
-                                        cname_host_name,
-                                        cname_private_hosted_zone,
-                                        'CNAME',
-                                        private_dns_name
-                                    )
-
-                                    caller_response.append('Deleted CNAME record in zone id: ' +
-                                                           str(cname_private_hosted_zone_id) +
-                                                           ' for hosted zone ' +
-                                                           str(cname_host_name) + '.' +
-                                                           str(cname_private_hosted_zone) +
-                                                           ' with value: ' +
-                                                           str(private_dns_name))
-
-                                except BaseException as err:
-                                    publish_to_sns(SNS_CLIENT, ACCOUNT, REGION,
-                                                   "Unexpected error:" + str(err) + lineno())
-                                    LOGGER.debug("%s", str(err) + lineno())
-
-                # Only do public if there is public ip on instance
-                if public_dns_name:
-                    # Iterate over the public hosted zones
-                    LOGGER.debug("Iterating over public hosted zones %s", lineno())
-                    for cname_public_hosted_zone in public_hosted_zones_collection:
-                        LOGGER.debug("cname in public hosted zone:"
-                                     " %s", str(cname_public_hosted_zone) + lineno())
-                        LOGGER.debug("cname is: %s", str(cname) + lineno())
-                        if cname.endswith(cname_public_hosted_zone):
-                            cname_public_hosted_zone_id = get_zone_id(
-                                route53,
-                                cname_public_hosted_zone,
-                                False
-                            )
-                            LOGGER.debug("cname_public_hosted_zone_id:"
-                                         " %s", str(cname_public_hosted_zone_id) + lineno())
-
-                            # create CNAME record in public zone
-                            if state == 'running':
-                                try:
-                                    create_resource_record(
-                                        route53,
-                                        cname_public_hosted_zone_id,
-                                        cname_host_name,
-                                        cname_public_hosted_zone,
-                                        'CNAME',
-                                        public_dns_name
-                                    )
-
-                                    caller_response.append('Created CNAME record in zone id: ' +
-                                                           str(cname_public_hosted_zone_id) +
-                                                           ' for hosted zone ' +
-                                                           str(cname_host_name) + '.' +
-                                                           str(cname_public_hosted_zone) +
-                                                           ' with value: ' +
-                                                           str(public_dns_name))
-
-                                except BaseException as err:
-                                    publish_to_sns(SNS_CLIENT, ACCOUNT, REGION,
-                                                   "Unexpected error:" + str(err) + lineno())
-                                    LOGGER.debug("%s", str(err) + lineno())
-                            else:
-                                try:
-                                    delete_resource_record(
-                                        route53,
-                                        cname_public_hosted_zone_id,
-                                        cname_host_name,
-                                        cname_public_hosted_zone,
-                                        'CNAME',
-                                        public_dns_name
-                                    )
-
-                                    caller_response.append('Deleted CNAME record in zone id: ' +
-                                                           str(cname_public_hosted_zone_id) +
-                                                           ' for hosted zone ' +
-                                                           str(cname_host_name) + '.' +
-                                                           str(cname_public_hosted_zone) +
-                                                           ' with value: ' +
-                                                           str(public_dns_name))
-
-                                except BaseException as err:
-                                    publish_to_sns(SNS_CLIENT, ACCOUNT, REGION,
-                                                   "Unexpected error:" +
-                                                   str(err) + lineno())
-                                    LOGGER.debug("%s", str(err) + lineno())
-
-    # Is there a DHCP option set?
-    # Get DHCP option set configuration
-    LOGGER.debug("\n#############\nIterate over DHCP option sets %s\n", lineno())
-
-    try:
-        LOGGER.debug("trying to get dhcp option set id %s", lineno())
-        dhcp_options_id = get_dhcp_option_set_id_for_vpc(compute, vpc_id)
-        LOGGER.debug("dhcp_options_id: %s", str(dhcp_options_id) + lineno())
-        dhcp_configurations = get_dhcp_configurations(compute, dhcp_options_id)
-        LOGGER.debug("dhcp_configurations: %s", str(get_dhcp_configurations) + lineno())
-
-    except BaseException as err:
-        LOGGER.info("No DHCP option set assigned to this VPC %s\n", str(err)+lineno())
-        publish_to_sns(SNS_CLIENT, ACCOUNT, REGION, "Unexpected error:" +
-                       str(err) + lineno())
-        exit()
-
-    # Look to see whether there's a DHCP option set assigned to
-    # the VPC.  If there is, use the value of the domain name
-    # to create resource records in the appropriate Route 53
-    # private hosted zone. This will also check to see whether
-    # there's an association between the instance's VPC and
-    # the private hosted zone.  If there isn't, it will create it.
-    for configuration in dhcp_configurations:
-
-        LOGGER.debug("configuration: %s", str(configuration) + lineno())
-        LOGGER.debug("private hosted zones: %s", str(private_hosted_zone_collection) + lineno())
-
-        if configuration in private_hosted_zone_collection:
-            private_hosted_zone_name = configuration
-            LOGGER.debug("Private zone found %s", str(private_hosted_zone_name) + lineno())
-
-            private_hosted_zone_id = get_zone_id(route53, private_hosted_zone_name)
-            LOGGER.debug("Private_hosted_zone_id: %s", str(private_hosted_zone_id) + lineno())
-            private_hosted_zone_properties = get_hosted_zone_properties(
-                route53,
-                private_hosted_zone_id
-            )
-
-            LOGGER.debug("private_hosted_zone_properties:"
-                         " %s", str(private_hosted_zone_properties) + lineno())
-
-            # create A records and PTR records
+    if private_hosted_zone_name in private_hosted_zone_collection:
+        private_hosted_zone_id = get_zone_id(route53, private_hosted_zone_name)
+        if private_hosted_zone_id:
+            LOGGER.info('Private zone found: %s', private_hosted_zone_name)
+    #        private_hosted_zone_properties = get_hosted_zone_properties(route53, private_hosted_zone_id)
             if state == 'running':
-                if vpc_id in map(lambda x: x['VPCId'], private_hosted_zone_properties['VPCs']):
-                    LOGGER.info("Private hosted zone %s is associated \
-with VPC %s %s", private_hosted_zone_id, vpc_id, lineno())
-                else:
-                    LOGGER.info("Associating zone %s with VPC"
-                                " %s %s", private_hosted_zone_id, vpc_id, lineno())
-                    try:
-                        associate_zone(route53, private_hosted_zone_id, region, vpc_id)
-                    except BaseException as err:
-                        LOGGER.info("You cannot create an association with a \
-                        VPC with an overlapping subdomain. %s\n", str(err))
-                        publish_to_sns(SNS_CLIENT, ACCOUNT, REGION, "Unexpected error:" +
-                                       str(err) + lineno())
-                        exit()
                 try:
-
-                    if not tag_type == 'cname':
-                        LOGGER.debug("Creating resource records %s", lineno())
-                        create_resource_record(
-                            route53,
-                            private_hosted_zone_id,
-                            private_host_name,
-                            private_hosted_zone_name,
-                            'A',
-                            private_ip
-                        )
-
-                        caller_response.append('Created A record in zone id: ' +
-                                               str(private_hosted_zone_id) +
-                                               ' for hosted zone ' +
-                                               str(private_host_name) + '.' +
-                                               str(private_hosted_zone_name) +
-                                               ' with value: ' +
-                                               str(private_ip))
-
-                        create_resource_record(
-                            route53,
-                            reverse_lookup_zone_id,
-                            reversed_ip_address,
-                            'in-addr.arpa',
-                            'PTR',
-                            private_dns_name
-                        )
-
-                        caller_response.append('Created PTR record in zone id: ' +
-                                               str(reverse_lookup_zone_id) +
-                                               ' for hosted zone ' +
-                                               str(reversed_ip_address) +
-                                               'in-addr.arpa with value: ' +
-                                               str(private_dns_name))
-
-                    else:
-                        LOGGER.debug("Creating resource records %s", lineno())
-                        create_resource_record(
-                            route53,
-                            private_hosted_zone_id,
-                            cname_prefix,
-                            private_hosted_zone_name,
-                            'A',
-                            private_ip
-                        )
-
-                        caller_response.append('Created A record in zone id: ' +
-                                               str(private_hosted_zone_id) + ' for hosted zone ' +
-                                               str(cname_prefix) + '.' +
-                                               str(private_hosted_zone_name) + ' with value: ' +
-                                               str(private_ip))
-
-                        create_resource_record(
-                            route53,
-                            reverse_lookup_zone_id,
-                            reversed_ip_address,
-                            'in-addr.arpa',
-                            'PTR',
-                            cname
-                        )
-
-                        caller_response.append('Created PTR record in zone id: ' +
-                                               str(reverse_lookup_zone_id) +
-                                               ' for hosted zone ' +
-                                               str(reversed_ip_address) +
-                                               'in-addr.arpa with value: ' +
-                                               str(cname))
-
-                except BaseException as err:
-                    publish_to_sns(SNS_CLIENT, ACCOUNT, REGION, "Unexpected error:" +
-                                   str(err) + lineno())
+                    LOGGER.info('Registering private: zone=%s name=%s cname=%s', private_hosted_zone_name, internal_host_name, internal_cname)
+                    create_resource_record(route53, private_hosted_zone_id, internal_host_name, private_hosted_zone_name, 'A', private_ip)
+                    create_resource_record(route53, reverse_lookup_zone_id, reversed_ip_address, 'in-addr.arpa', 'PTR', internal_host_name + "." + private_hosted_zone_name)
+                    if internal_cname:
+                        create_resource_record(route53, private_hosted_zone_id, internal_cname, private_hosted_zone_name, 'CNAME', internal_host_name + "." + private_hosted_zone_name)
+                except BaseException as e:
+                    LOGGER.error(e)
             else:
-
-                LOGGER.debug("Deleting resource records: %s", lineno())
                 try:
+                    LOGGER.info('Unregistering private: zone=%s name=%s cname=%s', private_hosted_zone_name, internal_host_name, internal_cname)
+                    delete_resource_record(route53, private_hosted_zone_id, private_host_name, private_hosted_zone_name, 'A', private_ip)
+                    delete_resource_record(route53, private_hosted_zone_id, internal_host_name, private_hosted_zone_name, 'A', private_ip)
+                    delete_resource_record(route53, private_hosted_zone_id, internal_host_name, private_hosted_zone_name, 'CNAME', private_dns_name)
+                    delete_resource_record(route53, reverse_lookup_zone_id, reversed_ip_address, 'in-addr.arpa', 'PTR', internal_host_name + "." + private_hosted_zone_name)
+                    if internal_cname:
+                        delete_resource_record(route53, private_hosted_zone_id, internal_cname, private_hosted_zone_name, 'CNAME', internal_host_name + "." + private_hosted_zone_name)
+                except BaseException as e:
+                    LOGGER.error(e)
+    else:
+        LOGGER.info('No private zone found for %s', private_hosted_zone_name)
 
-                    if not tag_type == 'cname':
-
-                        delete_resource_record(
-                            route53,
-                            private_hosted_zone_id,
-                            private_host_name,
-                            private_hosted_zone_name,
-                            'A',
-                            private_ip
-                        )
-
-                        caller_response.append('Deleted A record in zone id: ' +
-                                               str(private_hosted_zone_id) + ' for hosted zone ' +
-                                               str(private_host_name) + '.' +
-                                               str(private_hosted_zone_name) + ' with value: ' +
-                                               str(private_ip))
-
-                        delete_resource_record(
-                            route53,
-                            reverse_lookup_zone_id,
-                            reversed_ip_address,
-                            'in-addr.arpa',
-                            'PTR',
-                            private_dns_name
-                        )
-
-                        caller_response.append('Deleted PTR record in zone id: ' +
-                                               str(reverse_lookup_zone_id) +
-                                               ' for hosted zone ' +
-                                               str(reversed_ip_address) +
-                                               'in-addr.arpa with value: ' +
-                                               str(private_dns_name))
-                    else:
-
-                        delete_resource_record(
-                            route53,
-                            private_hosted_zone_id,
-                            cname_prefix,
-                            private_hosted_zone_name,
-                            'A',
-                            private_ip
-                        )
-
-                        caller_response.append('Deleted A record in zone id: ' +
-                                               str(private_hosted_zone_id) + ' for hosted zone ' +
-                                               str(cname_prefix) + '.' +
-                                               str(private_hosted_zone_name) + ' with value: ' +
-                                               str(private_ip))
-
-                        delete_resource_record(
-                            route53,
-                            reverse_lookup_zone_id,
-                            reversed_ip_address,
-                            'in-addr.arpa',
-                            'PTR',
-                            cname
-                        )
-
-                        caller_response.append('Deleted PTR record in zone id: ' +
-                                               str(reverse_lookup_zone_id) +
-                                               ' for hosted zone ' +
-                                               str(reversed_ip_address) +
-                                               'in-addr.arpa with value: ' +
-                                               str(cname))
-
-                except BaseException as err:
-                    publish_to_sns(SNS_CLIENT, ACCOUNT, REGION, "Unexpected error:" +
-                                   str(err) + lineno())
-        else:
-            LOGGER.debug("No matching zone for %s", str(configuration) + lineno())
+    if public_hosted_zone_name in public_hosted_zones_collection and public_ip:
+        public_hosted_zone_id = get_zone_id(route53, public_hosted_zone_name, False)
+        if public_hosted_zone_id:
+            LOGGER.info('Public zone found: %s', public_hosted_zone_name)
+            # create A record in public zone
+            if state =='running':
+                try:
+                    LOGGER.info('Registering public: zone=%s name=%s cname=%s', public_hosted_zone_name, external_host_name, external_cname)
+                    if external_host_name:
+                        create_resource_record(route53, public_hosted_zone_id, external_host_name, public_hosted_zone_name, 'CNAME', public_dns_name)
+                    if external_cname:
+                        create_resource_record(route53, public_hosted_zone_id, external_cname, public_hosted_zone_name, 'CNAME', external_host_name + "." + public_hosted_zone_name)
+                except BaseException as e:
+                    LOGGER.error(e)
+            else:
+                try:
+                    LOGGER.info('Unregistering public: zone=%s name=%s cname=%s ip=%s', public_hosted_zone_name, external_host_name, external_cname, public_ip)
+                    if public_host_name:
+                        delete_resource_record(route53, public_hosted_zone_id, public_host_name, public_hosted_zone_name, 'A', public_ip)
+                    if external_host_name:
+                        delete_resource_record(route53, public_hosted_zone_id, external_host_name, public_hosted_zone_name, 'A', public_ip)
+                        delete_resource_record(route53, public_hosted_zone_id, external_host_name, public_hosted_zone_name, 'CNAME', public_dns_name)
+                    if external_cname:
+                        delete_resource_record(route53, public_hosted_zone_id, external_cname, public_hosted_zone_name, 'CNAME', external_host_name + "." + public_hosted_zone_name)
+                except BaseException as e:
+                    LOGGER.error(e)
+    else:
+        LOGGER.info('No public zone or IP found for %s', public_hosted_zone_name)
 
     # Clean up DynamoDB after deleting records
     if state != 'running':
@@ -915,6 +414,22 @@ with VPC %s %s", private_hosted_zone_id, vpc_id, lineno())
     caller_response.insert(0, 'Successfully created recordsets')
 
     return caller_response
+
+def tag_value(tags, tag_name):
+    for tag in tags:
+        if tag_name.lstrip().upper() == tag.get('Key',{}).lstrip().upper():
+            return tag.get('Value')
+    # No matching tag, return None
+    return None
+    
+def first_tag_value(tags, tag_names):
+    for tag in tags:
+        entry_name = tag.get('Key', {}).lstrip().upper()
+        for tag_name in tag_names:
+            if tag_name.lstrip().upper() == entry_name:
+                return tag.get('Value')
+    # No matching tags, return None
+    return None
 
 def determine_tag_type(tags):
     """
